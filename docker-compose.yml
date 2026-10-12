@@ -1,0 +1,91 @@
+services:
+  # ---------------------------------------------------------
+  # Infrastructure: PostgreSQL and Redis
+  # ---------------------------------------------------------
+  postgres:
+    image: postgres:15-alpine
+    environment:
+      POSTGRES_USER: rq_user
+      POSTGRES_PASSWORD: rq_password
+      POSTGRES_DB: reliable_queue
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U rq_user -d reliable_queue"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6380:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  # ---------------------------------------------------------
+  # Reliable-Queue Services
+  # ---------------------------------------------------------
+  api:
+    build: 
+      context: .
+      args:
+        PACKAGE_NAME: api
+    ports:
+      - "3000:3000"
+    environment:
+      - DATABASE_URL=postgresql://rq_user:rq_password@postgres:5432/reliable_queue
+      - REDIS_URL=redis://redis:6379
+      - HOST=0.0.0.0
+      - PORT=3000
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+  worker:
+    build:
+      context: .
+      args:
+        PACKAGE_NAME: worker
+    # We use a custom command here because the worker entrypoint is index.js not server.js
+    command: ["node", "./packages/worker/dist/index.js"]
+    deploy:
+      replicas: 2 # Run two workers by default to test concurrency and leader election
+    environment:
+      - DATABASE_URL=postgresql://rq_user:rq_password@postgres:5432/reliable_queue
+      - REDIS_URL=redis://redis:6379
+      - QUEUE_NAME=default
+      - WORKER_CONCURRENCY=5
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+  dashboard:
+    build:
+      context: .
+      args:
+        PACKAGE_NAME: dashboard
+    ports:
+      - "3001:3001"
+    environment:
+      - DATABASE_URL=postgresql://rq_user:rq_password@postgres:5432/reliable_queue
+      - REDIS_URL=redis://redis:6379
+      - HOST=0.0.0.0
+      - PORT=3001
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+volumes:
+  pgdata:
