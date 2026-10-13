@@ -1,86 +1,57 @@
-// ---------------------------------------------------------------------------
-// Worker entry point — wires everything together and starts processing
-// ---------------------------------------------------------------------------
-
-import {
-  loadConfig,
-  getPool,
-  getRedis,
-  migrate,
-  QueueService,
-  closePool,
-  closeRedis,
-} from '@reliable-queue/core';
-
-import { Semaphore } from './semaphore';
-import { HeartbeatService } from './heartbeat';
-import { ReaperService } from './reaper';
-import { installShutdownHandlers, onShutdown, isDraining } from './shutdown';
-import { startWorkerLoop } from './worker';
-
+import { resolve } from 'node:path';
+import type { JobHandler } from '@reliable-queue/core';
+import { createRuntime, installSignals, startMonitor, delay } from '@reliable-queue/infrastructure';
+import { Worker } from './worker';
+export { Worker } from './worker';
+export { Semaphore } from './semaphore';
 async function main() {
-  const config = loadConfig();
-
-  console.log(`[worker] Starting worker ${config.workerId}`);
-  console.log(`[worker] Queue: ${config.queueName}, Concurrency: ${config.workerConcurrency}`);
-
-  // --- Infrastructure setup ---
-  await migrate(config);
-
-  const pool = getPool(config);
-  const redis = getRedis(config);
-  const queueService = new QueueService(pool, redis);
-  const semaphore = new Semaphore(config.workerConcurrency);
-
-  // --- Heartbeat: report liveness to Postgres --------------------------
-  const heartbeat = new HeartbeatService(
-    pool,
-    config.workerId,
-    config.heartbeatIntervalMs,
-    () => semaphore.active,
-  );
-  heartbeat.start();
-
-  // --- Reaper: recover stale jobs (leader-elected) ---------------------
-  const reaper = new ReaperService(
-    redis,
-    queueService,
-    config.workerId,
-    config.reaperIntervalMs,
-    config.reaperLockTtlMs,
-  );
-  reaper.start();
-
-  // --- Graceful shutdown -----------------------------------------------
-  installShutdownHandlers();
-
-  onShutdown(async () => {
-    console.log('[worker] Waiting for in-flight jobs to complete...');
-    // Wait up to 30 seconds for in-flight jobs
-    const deadline = Date.now() + 30_000;
-    while (semaphore.active > 0 && Date.now() < deadline) {
-      await new Promise((r) => setTimeout(r, 500));
+  const runtime = await createRuntime('worker', { port: Number(process.env.PORT ?? 3002) }, true);
+  try {
+    const handlers = new Map<string, JobHandler>();
+    if (runtime.config.demoMode)
+      handlers.set(runtime.config.queueName, async (job, context) => {
+        await delay(200, undefined, { signal: context.signal });
+        if (job.payload.fail)
+          throw new Error(String(job.payload.failReason ?? 'Simulated failure'));
+        return { processed: true, duration_ms: 200 };
+      });
+    if (runtime.config.handlerModule) {
+      const module = (await import(resolve(runtime.config.handlerModule))) as {
+        handlers: Record<string, JobHandler>;
+      };
+      for (const [queue, handler] of Object.entries(module.handlers)) {
+        if (typeof handler !== 'function') throw new Error(`Invalid handler: ${queue}`);
+        handlers.set(queue, handler);
+      }
     }
-    if (semaphore.active > 0) {
-      console.warn(`[worker] Force-exiting with ${semaphore.active} job(s) still in flight`);
-    }
-  });
-
-  onShutdown(async () => {
-    heartbeat.stop();
-    reaper.stop();
-  });
-
-  onShutdown(async () => {
-    await closeRedis();
-    await closePool();
-  });
-
-  // --- Start processing -----------------------------------------------
-  await startWorkerLoop(queueService, config, semaphore);
+    const worker = new Worker(
+      runtime.queue,
+      runtime.config,
+      handlers,
+      runtime.logger,
+      runtime.telemetry,
+      (active) => runtime.jobs.heartbeat(runtime.config.workerId, active),
+    );
+    const closeMonitor = await startMonitor(runtime, () => worker.ready);
+    installSignals(async () => {
+      try {
+        await worker.stop();
+      } finally {
+        try {
+          await closeMonitor();
+        } finally {
+          await runtime.close();
+        }
+      }
+    }, runtime.logger);
+    worker.start();
+  } catch (error) {
+    await runtime.close();
+    throw error;
+  }
 }
-
-main().catch((err) => {
-  console.error('[worker] Fatal error:', err);
-  process.exit(1);
-});
+if (require.main === module)
+  void main().catch((error) => {
+    process.stderr.write(String(error) + '\n');
+    process.exitCode = 1;
+  });

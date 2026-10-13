@@ -56,17 +56,79 @@ export interface AuditEntry {
 export interface EnqueueOptions {
   queue_name: string;
   payload: Record<string, unknown>;
-  priority?: number;       // 1 (lowest) – 10 (highest), default 5
-  delay_ms?: number;       // schedule the job N ms into the future
-  max_attempts?: number;   // default 3
+  priority?: number; // 1 (lowest) – 10 (highest), default 5
+  delay_ms?: number; // schedule the job N ms into the future
+  max_attempts?: number; // default 3
   idempotency_key?: string;
 }
 
 /** Result of an enqueue operation — includes whether a new job was created */
 export interface EnqueueResult {
   job: Job;
-  created: boolean;        // false when deduped via idempotency key
+  created: boolean; // false when deduped via idempotency key
 }
 
 /** Handler function executed by the worker for each job */
-export type JobHandler = (job: Job) => Promise<Record<string, unknown> | void>;
+export interface Logger {
+  info(details: Record<string, unknown>, message: string): void;
+  warn(details: Record<string, unknown>, message: string): void;
+  error(details: Record<string, unknown>, message: string): void;
+}
+export interface HandlerContext {
+  signal: AbortSignal;
+  attemptId: string;
+  executionCycle: number;
+  logger: Logger;
+}
+export type JobHandler = (
+  job: Job,
+  context: HandlerContext,
+) => Promise<Record<string, unknown> | void>;
+export interface StoredJob extends Job {
+  scheduling_generation: number;
+  execution_cycle: number;
+  lease_token: string | null;
+  history_complete: boolean;
+}
+export interface Candidate {
+  jobId: string;
+  generation: number;
+  queueName: string;
+}
+export interface Claim {
+  job: StoredJob;
+  token: string;
+  attemptId: string;
+}
+export interface JobFilters {
+  queue_name?: string;
+  queues?: string[];
+  status?: JobStatus;
+  limit?: number;
+  offset?: number;
+}
+export interface OutboxEntry {
+  id: string;
+  reservation_token: string;
+  job_id: string;
+  queue_name: string;
+  generation: number;
+  priority: number;
+  available_at: Date;
+  publish_attempts: number;
+}
+export interface MetricsSnapshot {
+  timestamp: string;
+  queueDepth: number;
+  jobsPerSecond: string;
+  dlqSize: number;
+  retryRate: string;
+  retries: number;
+  ready: number;
+  delayed: number;
+  processing: number;
+  dead: number;
+  dispatchLagSeconds: number;
+  queues: Array<{ name: string; ready: number; delayed: number; processing: number; dead: number }>;
+  workers: Array<{ id: string; jobsInFlight: number; status: 'alive' | 'dead'; lastSeen: Date }>;
+}

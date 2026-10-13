@@ -1,56 +1,37 @@
-// ---------------------------------------------------------------------------
-// Dashboard server — serves metrics API, SSE, and static frontend
-// ---------------------------------------------------------------------------
-
-import Fastify from 'fastify';
-import cors from '@fastify/cors';
-import fastifyStatic from '@fastify/static';
-import path from 'path';
-import { loadConfig, getPool, getRedis, migrate, QueueService, closePool, closeRedis } from '@reliable-queue/core';
-import { registerMetricsRoutes } from './routes/metrics';
-import { registerDLQRoutes } from './routes/dlq';
-
+import { createRuntime, installSignals } from '@reliable-queue/infrastructure';
+import { createDashboard } from './app';
+export { createDashboard } from './app';
 async function main() {
-  const config = loadConfig({ port: parseInt(process.env.PORT || '3001', 10) });
-
-  await migrate(config);
-
-  const pool = getPool(config);
-  const redis = getRedis(config);
-  const queueService = new QueueService(pool, redis);
-
-  const app = Fastify({ logger: true });
-
-  await app.register(cors, { origin: true });
-
-  // Serve static HTML frontend
-  await app.register(fastifyStatic, {
-    root: path.join(__dirname, '..', 'public'),
-    prefix: '/',
+  const runtime = await createRuntime('dashboard', { port: Number(process.env.PORT ?? 3001) });
+  const app = await createDashboard({
+    queue: runtime.queue,
+    auth: runtime.auth,
+    config: runtime.config,
+    telemetry: runtime.telemetry,
+    ready: async () => {
+      await runtime.pool.query('SELECT 1');
+    },
+  }).catch(async (error) => {
+    await runtime.close();
+    throw error;
   });
-
-  // Register API routes
-  registerMetricsRoutes(app, queueService, pool);
-  registerDLQRoutes(app, queueService);
-
-  // Start listening
-  await app.listen({ host: config.host, port: config.port });
-  console.log(`[dashboard] Server listening on ${config.host}:${config.port}`);
-
-  // Graceful shutdown
-  const shutdown = async () => {
-    console.log('[dashboard] Shutting down...');
+  installSignals(async () => {
+    try {
+      await app.close();
+    } finally {
+      await runtime.close();
+    }
+  }, runtime.logger);
+  try {
+    await app.listen({ host: runtime.config.host, port: runtime.config.port });
+  } catch (error) {
     await app.close();
-    await closeRedis();
-    await closePool();
-    process.exit(0);
-  };
-
-  process.on('SIGTERM', shutdown);
-  process.on('SIGINT', shutdown);
+    await runtime.close();
+    throw error;
+  }
 }
-
-main().catch((err) => {
-  console.error('[dashboard] Fatal error:', err);
-  process.exit(1);
-});
+if (require.main === module)
+  void main().catch((error) => {
+    process.stderr.write(String(error) + '\n');
+    process.exitCode = 1;
+  });

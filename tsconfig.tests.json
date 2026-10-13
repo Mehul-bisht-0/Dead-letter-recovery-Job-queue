@@ -1,0 +1,10 @@
+{
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "noEmit": true,
+    "declaration": false,
+    "rootDir": ".",
+    "lib": ["ES2022", "DOM"]
+  },
+  "include": ["tests/**/*.ts", "packages/**/src/__tests__/**/*.ts"]
+}

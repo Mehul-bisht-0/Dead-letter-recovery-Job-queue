@@ -1,44 +1,15 @@
-// ---------------------------------------------------------------------------
-// Exponential backoff with jitter for retry scheduling
-// ---------------------------------------------------------------------------
-//
-//   delay = min(base * 2^attempt, cap) + random_jitter
-//
-// The jitter is a random value in [0, delay * 0.25] which decorrelates
-// retries across workers, preventing "thundering herd" collisions when
-// many jobs fail at the same time and all come back simultaneously.
-// ---------------------------------------------------------------------------
-
-/**
- * Compute the backoff delay (in ms) for a given attempt number.
- *
- * @param attempt  - The current attempt number (0-based: first retry = 0)
- * @param baseMs   - Base delay in milliseconds (default 1 000)
- * @param capMs    - Maximum delay cap in milliseconds (default 60 000)
- * @returns delay in milliseconds including jitter
- */
+export function computeBackoffBase(attempt: number, baseMs = 1_000, capMs = 60_000): number {
+  if (!Number.isInteger(attempt) || attempt < 0 || baseMs <= 0 || capMs < baseMs) {
+    throw new RangeError('Invalid retry policy');
+  }
+  return Math.min(baseMs * 2 ** Math.min(attempt, 53), capMs);
+}
 export function computeBackoff(
   attempt: number,
-  baseMs: number = 1_000,
-  capMs: number = 60_000,
+  baseMs = 1_000,
+  capMs = 60_000,
+  random: () => number = Math.random,
 ): number {
-  // Exponential part: base * 2^attempt, clamped to cap
-  const exponential = Math.min(baseMs * Math.pow(2, attempt), capMs);
-
-  // Add jitter: random value in [0, 25% of the exponential delay]
-  const jitter = Math.random() * exponential * 0.25;
-
-  return Math.floor(exponential + jitter);
-}
-
-/**
- * Deterministic version (no jitter) useful for unit testing.
- * In production, always use computeBackoff which includes jitter.
- */
-export function computeBackoffBase(
-  attempt: number,
-  baseMs: number = 1_000,
-  capMs: number = 60_000,
-): number {
-  return Math.min(baseMs * Math.pow(2, attempt), capMs);
+  const base = computeBackoffBase(attempt, baseMs, capMs);
+  return Math.floor(Math.min(capMs, base + random() * base * 0.25));
 }

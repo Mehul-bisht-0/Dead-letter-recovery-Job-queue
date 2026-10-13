@@ -1,71 +1,33 @@
-// ---------------------------------------------------------------------------
-// Seed script to populate the queue for testing
-// ---------------------------------------------------------------------------
-
-import { loadConfig, getPool, getRedis, migrate, QueueService, closePool, closeRedis } from '@reliable-queue/core';
-
+import { client } from './client';
 async function main() {
-  const config = loadConfig();
-  await migrate(config);
-
-  const pool = getPool(config);
-  const redis = getRedis(config);
-  const queueService = new QueueService(pool, redis);
-
-  console.log('[seed] Enqueueing sample jobs...');
-
-  const promises: Promise<any>[] = [];
-
-  // 1. 80 normal jobs (will succeed)
-  for (let i = 0; i < 80; i++) {
-    promises.push(queueService.enqueue({
-      queue_name: config.queueName,
-      payload: { type: 'email', to: `user${i}@example.com` },
-      priority: Math.floor(Math.random() * 10) + 1 // random priority 1-10
-    }));
+  const api = client();
+  const results = [];
+  for (let i = 0; i < 100; i++) {
+    results.push(
+      await api.enqueue({
+        queue_name: api.queue,
+        payload: i < 80 ? { type: 'example' } : { fail: true, failReason: 'Seed failure' },
+        priority: (i % 10) + 1,
+        max_attempts: i < 95 ? 3 : 1,
+      }),
+    );
   }
-
-  // 2. 15 jobs designed to fail temporarily (to test retries)
-  // Our simulated worker will throw an error if `payload.fail` is true.
-  // In a real scenario, this would be a flaky downstream API.
-  for (let i = 0; i < 15; i++) {
-    promises.push(queueService.enqueue({
-      queue_name: config.queueName,
-      payload: { type: 'webhook', fail: true, failReason: 'Connection timeout' },
-      max_attempts: 3 // Will retry 2 times before DLQ
-    }));
-  }
-
-  // 3. 5 jobs designed to always fail (to quickly populate DLQ)
-  for (let i = 0; i < 5; i++) {
-    promises.push(queueService.enqueue({
-      queue_name: config.queueName,
-      payload: { type: 'payment', fail: true, failReason: 'Invalid card format' },
-      max_attempts: 1 // No retries, goes straight to DLQ
-    }));
-  }
-
-  // 4. Test idempotency (should only create 1 job)
-  promises.push(queueService.enqueue({
-    queue_name: config.queueName,
-    payload: { type: 'dedup_test' },
-    idempotency_key: 'seed-idempotency-key'
-  }));
-  promises.push(queueService.enqueue({
-    queue_name: config.queueName,
-    payload: { type: 'dedup_test' },
-    idempotency_key: 'seed-idempotency-key'
-  }));
-
-  await Promise.all(promises);
-
-  console.log(`[seed] Enqueued 101 jobs successfully.`);
-
-  await closeRedis();
-  await closePool();
+  for (let i = 0; i < 2; i++)
+    results.push(
+      await api.enqueue({
+        queue_name: api.queue,
+        payload: { type: 'dedup_test' },
+        idempotency_key: 'seed-idempotency-key',
+      }),
+    );
+  process.stdout.write(
+    JSON.stringify({
+      submitted: results.length,
+      created: results.filter((r) => r.created).length,
+    }) + '\n',
+  );
 }
-
-main().catch((err) => {
-  console.error('[seed] Fatal error:', err);
-  process.exit(1);
+void main().catch((error) => {
+  process.stderr.write(String(error) + '\n');
+  process.exitCode = 1;
 });

@@ -1,91 +1,77 @@
+name: reliable-queue
+x-runtime: &runtime
+  DATABASE_URL: postgresql://rq_user:${POSTGRES_PASSWORD:-rq_password}@postgres:5432/reliable_queue
+  REDIS_URL: redis://redis:6379
+  NODE_ENV: development
+  HOST: 0.0.0.0
+  ADMIN_USER: ${ADMIN_USER:-admin}
+  ADMIN_PASSWORD_HASH: ${ADMIN_PASSWORD_HASH:-}
+  TRUST_PROXY: 'false'
 services:
-  # ---------------------------------------------------------
-  # Infrastructure: PostgreSQL and Redis
-  # ---------------------------------------------------------
   postgres:
     image: postgres:15-alpine
     environment:
       POSTGRES_USER: rq_user
-      POSTGRES_PASSWORD: rq_password
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-rq_password}
       POSTGRES_DB: reliable_queue
-    ports:
-      - "5432:5432"
-    volumes:
-      - pgdata:/var/lib/postgresql/data
+    ports: ['127.0.0.1:5432:5432']
+    volumes: [pgdata:/var/lib/postgresql/data]
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U rq_user -d reliable_queue"]
+      test: ['CMD-SHELL', 'pg_isready -U rq_user -d reliable_queue']
       interval: 5s
       timeout: 5s
-      retries: 5
-
+      retries: 10
   redis:
     image: redis:7-alpine
-    ports:
-      - "6380:6379"
+    ports: ['127.0.0.1:6380:6379']
     healthcheck:
-      test: ["CMD", "redis-cli", "ping"]
+      test: ['CMD', 'redis-cli', 'ping']
       interval: 5s
       timeout: 5s
-      retries: 5
-
-  # ---------------------------------------------------------
-  # Reliable-Queue Services
-  # ---------------------------------------------------------
+      retries: 10
+  migrate:
+    build: { context: ., args: { PACKAGE_NAME: api } }
+    command: ['node', 'packages/infrastructure/dist/cli.js', 'migrate']
+    environment: *runtime
+    depends_on:
+      postgres: { condition: service_healthy }
   api:
-    build: 
-      context: .
-      args:
-        PACKAGE_NAME: api
-    ports:
-      - "3000:3000"
+    build: { context: ., args: { PACKAGE_NAME: api } }
+    ports: ['127.0.0.1:3000:3000']
     environment:
-      - DATABASE_URL=postgresql://rq_user:rq_password@postgres:5432/reliable_queue
-      - REDIS_URL=redis://redis:6379
-      - HOST=0.0.0.0
-      - PORT=3000
+      <<: *runtime
+      PORT: '3000'
     depends_on:
-      postgres:
-        condition: service_healthy
-      redis:
-        condition: service_healthy
-
+      migrate: { condition: service_completed_successfully }
   worker:
-    build:
-      context: .
-      args:
-        PACKAGE_NAME: worker
-    # We use a custom command here because the worker entrypoint is index.js not server.js
-    command: ["node", "./packages/worker/dist/index.js"]
-    deploy:
-      replicas: 2 # Run two workers by default to test concurrency and leader election
+    build: { context: ., args: { PACKAGE_NAME: worker } }
     environment:
-      - DATABASE_URL=postgresql://rq_user:rq_password@postgres:5432/reliable_queue
-      - REDIS_URL=redis://redis:6379
-      - QUEUE_NAME=default
-      - WORKER_CONCURRENCY=5
+      <<: *runtime
+      PORT: '3002'
+      QUEUE_NAME: ${QUEUE_NAME:-default}
+      WORKER_CONCURRENCY: '5'
+      DEMO_MODE: ${DEMO_MODE:-true}
+      HANDLER_MODULE: ${HANDLER_MODULE:-}
+    stop_grace_period: 45s
     depends_on:
-      postgres:
-        condition: service_healthy
-      redis:
-        condition: service_healthy
-
+      migrate: { condition: service_completed_successfully }
+      redis: { condition: service_healthy }
+  dispatcher:
+    build: { context: ., args: { PACKAGE_NAME: dispatcher } }
+    environment:
+      <<: *runtime
+      PORT: '3003'
+    stop_grace_period: 45s
+    depends_on:
+      migrate: { condition: service_completed_successfully }
+      redis: { condition: service_healthy }
   dashboard:
-    build:
-      context: .
-      args:
-        PACKAGE_NAME: dashboard
-    ports:
-      - "3001:3001"
+    build: { context: ., args: { PACKAGE_NAME: dashboard } }
+    ports: ['127.0.0.1:3001:3001']
     environment:
-      - DATABASE_URL=postgresql://rq_user:rq_password@postgres:5432/reliable_queue
-      - REDIS_URL=redis://redis:6379
-      - HOST=0.0.0.0
-      - PORT=3001
+      <<: *runtime
+      PORT: '3001'
     depends_on:
-      postgres:
-        condition: service_healthy
-      redis:
-        condition: service_healthy
-
+      migrate: { condition: service_completed_successfully }
 volumes:
   pgdata:

@@ -1,0 +1,21 @@
+groups:
+  - name: reliable-queue
+    rules:
+      - alert: QueueDispatchLag
+        expr: rq_dispatch_lag_seconds > 60
+        for: 5m
+        labels: { severity: warning }
+        annotations: { summary: 'Queue dispatch has fallen behind' }
+      - alert: QueueLeaseRenewalFailure
+        expr: increase(rq_lease_renewal_failures_total[5m]) > 0
+        labels: { severity: warning }
+        annotations: { summary: 'Workers are losing execution leases' }
+      - alert: QueueMissingWorkers
+        expr: rq_alive_workers == 0 and sum(rq_jobs{status="ready"}) > 0
+        for: 1m
+        labels: { severity: critical }
+        annotations: { summary: 'Ready jobs have no live workers' }
+      - alert: QueueDeadLettersGrowing
+        expr: delta(rq_jobs{status="dead"}[10m]) > 10
+        labels: { severity: warning }
+        annotations: { summary: 'Dead-letter backlog is increasing' }

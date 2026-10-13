@@ -1,116 +1,205 @@
-// ---------------------------------------------------------------------------
-// Worker — the main job processing loop
-// ---------------------------------------------------------------------------
-
-import { QueueService, Config, Job, JobHandler } from '@reliable-queue/core';
+import {
+  QueueError,
+  type QueueService,
+  type JobHandler,
+  type Claim,
+  type Logger,
+} from '@reliable-queue/core';
+import { delay, repeat, type Config, type Telemetry } from '@reliable-queue/infrastructure';
 import { Semaphore } from './semaphore';
-import { isDraining } from './shutdown';
-
-/**
- * Registry of job handlers keyed by queue name.
- * The worker looks up the handler for each claimed job's queue_name.
- */
-const handlers = new Map<string, JobHandler>();
-
-/** Register a handler function for a specific queue */
-export function registerHandler(queueName: string, handler: JobHandler): void {
-  handlers.set(queueName, handler);
-  console.log(`[worker] Registered handler for queue "${queueName}"`);
-}
-
-/**
- * Start the worker polling loop. Claims jobs from Redis, executes the
- * registered handler, and acks/nacks based on the result.
- */
-export async function startWorkerLoop(
-  queueService: QueueService,
-  config: Config,
-  semaphore: Semaphore,
-): Promise<void> {
-  const { queueName, workerId, visibilityTimeoutMs, pollIntervalMs, backoffBaseMs, backoffCapMs } = config;
-
-  console.log(`[worker] Starting poll loop for queue "${queueName}" (concurrency=${semaphore['max']})`);
-
-  while (!isDraining()) {
-    try {
-      // Wait for a concurrency slot before claiming
-      await semaphore.acquire();
-
-      if (isDraining()) {
-        semaphore.release();
+export class Worker {
+  private readonly polling = new AbortController();
+  private readonly maintenance = new AbortController();
+  private readonly executions = new Map<Promise<void>, AbortController>();
+  private readonly semaphore: Semaphore;
+  private loop: Promise<void> | null = null;
+  private heartbeat: Promise<void> | null = null;
+  private closing: Promise<void> | null = null;
+  constructor(
+    private readonly queue: QueueService,
+    private readonly config: Config,
+    private readonly handlers: ReadonlyMap<string, JobHandler>,
+    private readonly logger: Logger,
+    private readonly telemetry: Telemetry,
+    private readonly beat: (active: number) => Promise<void>,
+    private readonly terminate: () => void = () => process.exit(1),
+  ) {
+    this.semaphore = new Semaphore(config.workerConcurrency);
+    if (!handlers.has(config.queueName))
+      throw new Error(`No handler registered for ${config.queueName}`);
+  }
+  get ready() {
+    return !this.polling.signal.aborted;
+  }
+  get active() {
+    return this.semaphore.active;
+  }
+  start(): void {
+    if (this.loop) throw new Error('Worker already started');
+    this.heartbeat = repeat(
+      this.config.heartbeatIntervalMs,
+      () => this.beat(this.active),
+      this.maintenance.signal,
+      this.logger,
+    );
+    this.loop = this.poll();
+  }
+  private async poll() {
+    while (!this.polling.signal.aborted) {
+      const release = this.semaphore.tryAcquire();
+      if (release) {
+        try {
+          const claim = await this.queue.claim(
+            this.config.queueName,
+            this.config.workerId,
+            this.config.visibilityTimeoutMs,
+          );
+          if (!claim) release();
+          else {
+            const controller = new AbortController();
+            if (this.polling.signal.aborted) {
+              release();
+              continue;
+            } // Unexecuted claim recovers via expiry.
+            const task = this.execute(claim, controller)
+              .catch((error) =>
+                this.logger.error({ err: error, jobId: claim.job.id }, 'Execution failed'),
+              )
+              .finally(() => {
+                release();
+                this.executions.delete(task);
+              });
+            this.executions.set(task, controller);
+          }
+        } catch (error) {
+          release();
+          this.logger.error({ err: error }, 'Claim failed');
+        }
+      }
+      try {
+        await delay(this.config.pollIntervalMs, undefined, { signal: this.polling.signal });
+      } catch {
         break;
       }
-
-      // Try to claim a job
-      const job = await queueService.claim(queueName, workerId, visibilityTimeoutMs);
-
-      if (!job) {
-        semaphore.release();
-        // No jobs available — wait before next poll
-        await sleep(pollIntervalMs);
-        continue;
-      }
-
-      // Process the job asynchronously (don't await — allow concurrency)
-      processJob(job, queueService, semaphore, backoffBaseMs, backoffCapMs).catch((err) => {
-        console.error(`[worker] Unexpected error processing job ${job.id}:`, err);
-        semaphore.release();
-      });
-
-    } catch (err: any) {
-      console.error('[worker] Poll loop error:', err.message);
-      await sleep(pollIntervalMs * 5); // Back off on errors
     }
   }
-
-  console.log('[worker] Poll loop stopped (draining)');
-}
-
-/**
- * Process a single job: look up handler, execute, ack or nack.
- */
-async function processJob(
-  job: Job,
-  queueService: QueueService,
-  semaphore: Semaphore,
-  backoffBaseMs: number,
-  backoffCapMs: number,
-): Promise<void> {
-  const handler = handlers.get(job.queue_name) ?? defaultHandler;
-
-  try {
-    console.log(`[worker] Processing job ${job.id} (queue=${job.queue_name}, attempt=${job.attempts})`);
-    const result = await handler(job);
-    await queueService.ack(job.id, result ?? undefined);
-    console.log(`[worker] ✓ Completed job ${job.id}`);
-  } catch (err: any) {
-    const errorMessage = err.message ?? String(err);
-    console.error(`[worker] ✗ Failed job ${job.id}: ${errorMessage}`);
-
-    const outcome = await queueService.nack(job.id, errorMessage, backoffBaseMs, backoffCapMs);
-    console.log(`[worker] Job ${job.id} → ${outcome}`);
-  } finally {
-    semaphore.release();
+  private async execute(claim: Claim, controller: AbortController): Promise<void> {
+    const renewal = new AbortController();
+    let lost = false;
+    const renewals = repeat(
+      this.config.leaseRenewalMs,
+      async () => {
+        try {
+          if (!(await this.queue.renew(claim, this.config.visibilityTimeoutMs)))
+            throw new QueueError('LEASE_LOST', 'Lease renewal rejected');
+        } catch (error) {
+          lost = true;
+          this.telemetry.failures.inc();
+          controller.abort(error);
+          renewal.abort();
+        }
+      },
+      renewal.signal,
+      this.logger,
+    );
+    const deadline = setTimeout(
+      () => controller.abort(new Error('Handler deadline exceeded')),
+      this.config.jobDeadlineMs,
+    );
+    let kill: ReturnType<typeof setTimeout> | undefined;
+    const aborted = () => {
+      kill = setTimeout(() => {
+        this.logger.error(
+          { jobId: claim.job.id },
+          'Handler ignored cancellation; terminating worker',
+        );
+        this.terminate();
+      }, this.config.cancellationGraceMs);
+    };
+    controller.signal.addEventListener('abort', aborted, { once: true });
+    const stopTimer = this.telemetry.duration.startTimer();
+    const details = {
+      jobId: claim.job.id,
+      attemptId: claim.attemptId,
+      executionCycle: claim.job.execution_cycle,
+      workerId: this.config.workerId,
+    };
+    const contextLogger: Logger = {
+      info: (fields, message) => this.logger.info({ ...fields, ...details }, message),
+      warn: (fields, message) => this.logger.warn({ ...fields, ...details }, message),
+      error: (fields, message) => this.logger.error({ ...fields, ...details }, message),
+    };
+    let result: Record<string, unknown> | void = undefined;
+    let handlerError: unknown;
+    let failed = false;
+    contextLogger.info({ attempt: claim.job.attempts }, 'Job execution started');
+    try {
+      result = await this.handlers.get(claim.job.queue_name)!(claim.job, {
+        signal: controller.signal,
+        attemptId: claim.attemptId,
+        executionCycle: claim.job.execution_cycle,
+        logger: contextLogger,
+      });
+      if (controller.signal.aborted) {
+        failed = true;
+        handlerError = controller.signal.reason;
+      }
+    } catch (error) {
+      failed = true;
+      handlerError = error;
+    } finally {
+      clearTimeout(deadline);
+      if (kill) clearTimeout(kill);
+      controller.signal.removeEventListener('abort', aborted);
+      stopTimer();
+    }
+    try {
+      if (lost) {
+        this.telemetry.outcomes.inc({ outcome: 'lease_lost' });
+        return;
+      }
+      if (failed) {
+        const outcome = await this.queue.nack(
+          claim,
+          handlerError instanceof Error ? handlerError.message : String(handlerError),
+        );
+        this.telemetry.outcomes.inc({ outcome });
+        contextLogger.warn({ outcome }, 'Job execution failed');
+      } else {
+        // Storage errors escape this branch; successful handlers are never nacked.
+        await this.queue.ack(claim, result ?? undefined);
+        this.telemetry.outcomes.inc({ outcome: 'completed' });
+        contextLogger.info({}, 'Job execution completed');
+      }
+    } finally {
+      renewal.abort();
+      await renewals;
+    }
   }
-}
-
-/**
- * Default handler — simulates work with a random delay.
- * Replace by calling registerHandler() for your queue.
- */
-const defaultHandler: JobHandler = async (job: Job) => {
-  // Simulate work (200-800ms)
-  const workMs = 200 + Math.random() * 600;
-  await sleep(workMs);
-
-  // Check if this job is designed to fail (payload.fail === true)
-  if (job.payload.fail) {
-    throw new Error(`Simulated failure for job ${job.id}: ${job.payload.failReason ?? 'unknown'}`);
+  stop(): Promise<void> {
+    if (this.closing) return this.closing;
+    this.closing = this.drain();
+    return this.closing;
   }
-
-  return { processed: true, duration_ms: Math.round(workMs) };
-};
-
-function sleep(ms: number): Promise<void> {
-  return new Promise((resolve) => setTimeout(resolve, ms));
+  private async drain() {
+    this.polling.abort();
+    await this.loop;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const completed = Promise.allSettled([...this.executions.keys()]);
+    await Promise.race([
+      completed,
+      new Promise<void>((resolve) => {
+        timer = setTimeout(resolve, this.config.drainTimeoutMs);
+      }),
+    ]);
+    if (timer) clearTimeout(timer);
+    if (this.executions.size) {
+      for (const controller of this.executions.values())
+        controller.abort(new Error('Worker draining'));
+      await completed;
+    }
+    this.maintenance.abort();
+    await this.heartbeat;
+    await this.beat(0);
+  }
 }

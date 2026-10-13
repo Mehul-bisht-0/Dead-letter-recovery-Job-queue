@@ -1,52 +1,38 @@
-// ---------------------------------------------------------------------------
-// Fastify API server — entry point for the HTTP API service
-// ---------------------------------------------------------------------------
-
-import Fastify from 'fastify';
-import cors from '@fastify/cors';
-import { loadConfig, getPool, getRedis, migrate, QueueService, closePool, closeRedis } from '@reliable-queue/core';
-import { registerJobRoutes } from './routes/jobs';
-import { registerDLQRoutes } from './routes/dlq';
-
+import { createRuntime, installSignals } from '@reliable-queue/infrastructure';
+import { createApp } from './app';
+export { createApp } from './app';
 async function main() {
-  const config = loadConfig();
-
-  // Run schema migration before starting the server
-  await migrate(config);
-
-  const pool = getPool(config);
-  const redis = getRedis(config);
-  const queueService = new QueueService(pool, redis);
-
-  const app = Fastify({ logger: true });
-
-  await app.register(cors, { origin: true });
-
-  // Health check
-  app.get('/health', async () => ({ status: 'ok', timestamp: new Date().toISOString() }));
-
-  // Register route modules
-  registerJobRoutes(app, queueService);
-  registerDLQRoutes(app, queueService);
-
-  // Start listening
-  await app.listen({ host: config.host, port: config.port });
-  console.log(`[api] Server listening on ${config.host}:${config.port}`);
-
-  // Graceful shutdown
-  const shutdown = async () => {
-    console.log('[api] Shutting down...');
+  const runtime = await createRuntime('api');
+  const app = await createApp({
+    queue: runtime.queue,
+    auth: runtime.auth,
+    telemetry: runtime.telemetry,
+    ready: async () => {
+      await runtime.pool.query('SELECT 1');
+    },
+    corsOrigins: runtime.config.corsOrigins,
+    trustProxy: runtime.config.trustProxy,
+  }).catch(async (error) => {
+    await runtime.close();
+    throw error;
+  });
+  installSignals(async () => {
+    try {
+      await app.close();
+    } finally {
+      await runtime.close();
+    }
+  }, runtime.logger);
+  try {
+    await app.listen({ host: runtime.config.host, port: runtime.config.port });
+  } catch (error) {
     await app.close();
-    await closeRedis();
-    await closePool();
-    process.exit(0);
-  };
-
-  process.on('SIGTERM', shutdown);
-  process.on('SIGINT', shutdown);
+    await runtime.close();
+    throw error;
+  }
 }
-
-main().catch((err) => {
-  console.error('[api] Fatal error:', err);
-  process.exit(1);
-});
+if (require.main === module)
+  void main().catch((error) => {
+    process.stderr.write(String(error) + '\n');
+    process.exitCode = 1;
+  });

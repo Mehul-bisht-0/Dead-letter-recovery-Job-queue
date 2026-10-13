@@ -1,16 +1,27 @@
 {
   "name": "@reliable-queue/dashboard",
-  "version": "1.0.0",
+  "version": "2.0.0",
   "private": true,
-  "main": "./src/server.ts",
-  "scripts": {
-    "dev": "tsx src/server.ts",
-    "start": "tsx src/server.ts"
+  "main": "./dist/server.js",
+  "types": "./dist/server.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/server.d.ts",
+      "default": "./dist/server.js"
+    }
   },
   "dependencies": {
     "@reliable-queue/core": "*",
-    "fastify": "^4.28.0",
-    "@fastify/cors": "^9.0.0",
-    "@fastify/static": "^7.0.0"
+    "@reliable-queue/contracts": "*",
+    "@reliable-queue/infrastructure": "*",
+    "fastify": "^5.0.0",
+    "@fastify/cookie": "^11.0.0",
+    "@fastify/static": "^10.1.6",
+    "@fastify/rate-limit": "^10.0.0",
+    "@sinclair/typebox": "^0.34.0"
+  },
+  "scripts": {
+    "dev": "tsx src/server.ts",
+    "start": "node dist/server.js"
   }
 }

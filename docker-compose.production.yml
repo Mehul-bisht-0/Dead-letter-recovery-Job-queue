@@ -1,0 +1,25 @@
+# Supply external storage credentials and put HTTP endpoints behind HTTPS.
+services:
+  api:
+    environment: &production
+      NODE_ENV: production
+      DATABASE_URL: ${DATABASE_URL:?Set production DATABASE_URL}
+      REDIS_URL: ${REDIS_URL:?Set production REDIS_URL}
+      ADMIN_PASSWORD_HASH: ${ADMIN_PASSWORD_HASH:?Set administrator password hash}
+      TRUST_PROXY: ${TRUST_PROXY:-false}
+      CORS_ORIGINS: ${CORS_ORIGINS:-}
+    restart: unless-stopped
+  worker:
+    environment:
+      <<: *production
+      DEMO_MODE: 'false'
+      HANDLER_MODULE: ${HANDLER_MODULE:?Set compiled handler module path}
+    restart: unless-stopped
+  dispatcher:
+    environment: *production
+    restart: unless-stopped
+  dashboard:
+    environment: *production
+    restart: unless-stopped
+  migrate:
+    environment: *production

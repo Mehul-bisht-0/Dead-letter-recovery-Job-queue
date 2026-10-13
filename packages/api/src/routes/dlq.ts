@@ -1,40 +1,39 @@
-// ---------------------------------------------------------------------------
-// /dlq routes — list dead-letter entries, replay
-// ---------------------------------------------------------------------------
-
-import { FastifyInstance } from 'fastify';
-import { QueueService } from '@reliable-queue/core';
-
+import type { FastifyInstance } from 'fastify';
+import type { QueueService } from '@reliable-queue/core';
+import { requireAdministrator } from '@reliable-queue/infrastructure';
+import { Type } from '@sinclair/typebox';
+import {
+  Pagination,
+  IdParams,
+  DLQEnvelope,
+  JobSchema,
+  serializeJob,
+  serializeDeadLetter,
+} from '@reliable-queue/contracts';
 export function registerDLQRoutes(app: FastifyInstance, queue: QueueService) {
-
-  // -----------------------------------------------------------------------
-  // GET /dlq — List dead letter entries
-  // -----------------------------------------------------------------------
-  app.get<{
-    Querystring: { limit?: string; offset?: string };
-  }>('/dlq', async (request, reply) => {
-    const limit = request.query.limit ? parseInt(request.query.limit, 10) : 50;
-    const offset = request.query.offset ? parseInt(request.query.offset, 10) : 0;
-
-    const result = await queue.listDeadLetters(limit, offset);
-    return reply.send(result);
-  });
-
-  // -----------------------------------------------------------------------
-  // POST /dlq/:id/replay — Re-enqueue a dead-lettered job
-  // -----------------------------------------------------------------------
-  app.post<{ Params: { id: string } }>('/dlq/:id/replay', async (request, reply) => {
-    try {
-      const job = await queue.replayFromDLQ(request.params.id);
-      return reply.status(200).send({
+  app.get<{ Querystring: { limit?: number; offset?: number } }>(
+    '/dlq',
+    { schema: { querystring: Pagination, response: { 200: DLQEnvelope } } },
+    async (request) => {
+      requireAdministrator(request.principal!);
+      const result = await queue.listDeadLetters(request.query.limit, request.query.offset);
+      return { items: result.items.map(serializeDeadLetter), total: result.total };
+    },
+  );
+  app.post<{ Params: { id: string } }>(
+    '/dlq/:id/replay',
+    {
+      schema: {
+        params: IdParams,
+        response: { 200: Type.Object({ message: Type.String(), job: JobSchema }) },
+      },
+    },
+    async (request) => {
+      requireAdministrator(request.principal!);
+      return {
         message: 'Job replayed successfully',
-        job,
-      });
-    } catch (err: any) {
-      if (err.message?.includes('not found')) {
-        return reply.status(404).send({ error: err.message });
-      }
-      throw err;
-    }
-  });
+        job: serializeJob(await queue.replayFromDLQ(request.params.id, request.principal!.id)),
+      };
+    },
+  );
 }
